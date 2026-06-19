@@ -3,17 +3,24 @@ package abstractGoNet
 import (
     "errors"
     "io"
+    "log"
     "net"
     "os"
     "sync"
     "time"
 )
 
+var HostNotFoundErr = errors.New(
+    "Hostname did not resolve to a known host",
+)
 var ListenerClosedErr = errors.New("Listener Closed")
+var ListenerConflictErr = errors.New("Listener already registered")
+var ListenerNotFoundErr = errors.New("Listener already registered")
 
 // An abstract template matching that of [net].
 type Net interface {
     Listen(network, address string) (net.Listener, error)
+    Dial(network, address string) (net.Conn, error)
 }
 
 type realNetImpl struct { }
@@ -25,6 +32,10 @@ func RealNet() Net {
 
 func (_ *realNetImpl) Listen(network, address string) (net.Listener, error) {
     return net.Listen(network, address)
+}
+
+func (_ *realNetImpl) Dial(network, address string) (net.Conn, error) {
+    return net.Dial(network, address)
 }
 
 // Thread-safe map of virtual hosts, each of which implements [Net].
@@ -105,6 +116,23 @@ func (self *virtualAddr) String() string {
     return self.address
 }
 
+func (self *virtualHost) addr(network string) net.Addr {
+    addr := virtualAddr { network, "" }
+
+    for _, a := range self.info.Addrs {
+        addr.address = a
+        return &addr
+    }
+    
+    for _, n := range self.info.Names {
+        addr.address = n
+        return &addr
+    }
+
+    log.Fatal("host has no addresses")
+    return nil
+}
+
 func (self *virtualHost) Listen(network, address string) (net.Listener, error) {
     self.wan.mutex.Lock()
     defer self.wan.mutex.Unlock()
@@ -114,9 +142,14 @@ func (self *virtualHost) Listen(network, address string) (net.Listener, error) {
         return nil, err
     }
 
-    addr := virtualAddr { network, address }
+    if _, exists := self.listenersByPort[port]; exists {
+        return nil, ListenerConflictErr
+    }
+
+    addr := self.addr(network)
+    addrWithPort := virtualAddr { network, addr.String() + address }
     listener := virtualListener {
-        self, port, addr, make(chan acceptPayload),
+        self, port, addrWithPort, make(chan acceptPayload),
     }
     self.listenersByPort[port] = listener
     return &listener, nil
@@ -124,8 +157,9 @@ func (self *virtualHost) Listen(network, address string) (net.Listener, error) {
 
 type acceptPayload struct {
     populated bool
-    pipe os.File
-    remoteAddr virtualAddr
+    rpipe os.File
+    wpipe os.File
+    remoteAddr net.Addr
 }
 
 type virtualListener struct {
@@ -142,7 +176,7 @@ func (self *virtualListener) Accept() (net.Conn, error) {
     }
 
     conn := virtualConn {
-        payload.pipe, self.addr, payload.remoteAddr, false,
+        payload.rpipe, payload.wpipe, &self.addr, payload.remoteAddr,
     }
     return &conn, nil
 }
@@ -163,22 +197,56 @@ func (self *virtualListener) Close() error {
     return nil
 }
 
+func (self *virtualHost) Dial(network, address string) (net.Conn, error) {
+    self.wan.mutex.Lock()
+    defer self.wan.mutex.Unlock()
+
+    hostname, port, err := net.SplitHostPort(address)
+    if err != nil {
+        return nil, err
+    }
+
+    host, exists := self.wan.hosts[hostname]
+    if !exists {
+        return nil, HostNotFoundErr
+    }
+
+    listener, exists := host.listenersByPort[port]
+    if !exists {
+        return nil, ListenerNotFoundErr
+    }
+
+    lr, rw, err := os.Pipe()
+    rr, lw, err := os.Pipe()
+    localAddr := self.addr(network)
+
+    conn := virtualConn {
+        *lr, *lw, localAddr, &listener.addr,
+    }
+    payload := acceptPayload {
+        true, *rr, *rw, localAddr,
+    }
+    listener.acceptChan <- payload
+
+    return &conn, nil
+}
+
 type virtualConn struct {
-    pipe os.File
-    localAddr virtualAddr
-    remoteAddr virtualAddr
-    closed bool
+    rpipe os.File
+    wpipe os.File
+    localAddr net.Addr
+    remoteAddr net.Addr
 }
 
 func (self *virtualConn) Read(b []byte) (int, error) {
-    n, err := self.pipe.Read(b)
+    n, err := self.rpipe.Read(b)
 
     if err != nil && err != io.EOF {
         err = &net.OpError{
             Op: "read",
-            Net: self.localAddr.network,
-            Source: &self.localAddr,
-            Addr: &self.remoteAddr,
+            Net: self.localAddr.Network(),
+            Source: self.localAddr,
+            Addr: self.remoteAddr,
             Err: err,
         }
     }
@@ -187,14 +255,14 @@ func (self *virtualConn) Read(b []byte) (int, error) {
 }
 
 func (self *virtualConn) Write(b []byte) (int, error) {
-    n, err := self.pipe.Write(b)
+    n, err := self.wpipe.Write(b)
 
     if err != nil && err != io.EOF {
         err = &net.OpError{
             Op: "write",
-            Net: self.localAddr.network,
-            Source: &self.localAddr,
-            Addr: &self.remoteAddr,
+            Net: self.localAddr.Network(),
+            Source: self.localAddr,
+            Addr: self.remoteAddr,
             Err: err,
         }
     }
@@ -203,15 +271,18 @@ func (self *virtualConn) Write(b []byte) (int, error) {
 }
 
 func (self *virtualConn) Close() error {
-    return self.pipe.Close()
+    if err := self.rpipe.Close(); err != nil {
+        return err
+    }
+    return self.wpipe.Close()
 }
 
 func (self *virtualConn) LocalAddr() net.Addr {
-    return &self.localAddr
+    return self.localAddr
 }
 
 func (self *virtualConn) RemoteAddr() net.Addr {
-    return &self.remoteAddr
+    return self.remoteAddr
 }
 
 func (self *virtualConn) SetDeadline(t time.Time) error {
