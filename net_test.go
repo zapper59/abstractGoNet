@@ -7,13 +7,20 @@ import (
     "testing"
 )
 
-func TestRealNet(t *testing.T) {
+func TestRealNetListen(t *testing.T) {
     listener, err := RealNet().Listen("tcp", ":")
     if err != nil {
         t.Error(err)
     }
     if err = listener.Close(); err != nil {
         t.Error(err)
+    }
+}
+
+func TestRealNetDial(t *testing.T) {
+    _, err := RealNet().Dial("tcp", "localhost:70000")
+    if err == nil {
+        t.Errorf("Connected to invalid port")
     }
 }
 
@@ -124,6 +131,36 @@ func TestDialBasic(t *testing.T) {
 
     err = roundTripData(conn1, conn2)
     if err != nil {
+        t.Error(err)
+    }
+}
+
+func TestDialWrongPort(t *testing.T) {
+    wan := NewVirtualWan()
+    host1 := wan.NewVirtualHost("a")
+    _, err := host1.Listen("tcp", ":123")
+    if err != nil {
+        t.Error(err)
+    }
+
+    host2 := wan.NewVirtualHost("b")
+    _, err = host2.Dial("tcp", "a:321")
+    if err != ListenerNotFoundErr {
+        t.Error(err)
+    }
+}
+
+func TestDialWrongHost(t *testing.T) {
+    wan := NewVirtualWan()
+    host1 := wan.NewVirtualHost("a")
+    _, err := host1.Listen("tcp", ":123")
+    if err != nil {
+        t.Error(err)
+    }
+
+    host2 := wan.NewVirtualHost("b")
+    _, err = host2.Dial("tcp", "c:123")
+    if err != HostNotFoundErr {
         t.Error(err)
     }
 }
